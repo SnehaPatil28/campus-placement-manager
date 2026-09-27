@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.database import engine, Base
-from app.routers import auth_router, student_router, company_router
+from app.routers import auth_router, student_router, company_router, drives_router
 
 # Auto-create SQLite database tables on server initialization
 Base.metadata.create_all(bind=engine)
@@ -25,6 +25,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(student_router)
 app.include_router(company_router)
+app.include_router(drives_router)
 
 
 @app.get("/health", tags=["Health"])
