@@ -10,8 +10,8 @@ from app.models.application import Application, ApplicationStatus
 from app.services.drive_service import get_evaluated_drive_status
 from app.services.profile_service import calculate_profile_completeness
 from app.services.eligibility_service import evaluate_student_eligibility
+from app.services.notification_service import create_notification
 
-# Defined valid state transition map for application lifecycle
 VALID_TRANSITIONS = {
     ApplicationStatus.APPLIED: {ApplicationStatus.SHORTLISTED, ApplicationStatus.REJECTED},
     ApplicationStatus.SHORTLISTED: {ApplicationStatus.INTERVIEW, ApplicationStatus.REJECTED},
@@ -22,15 +22,6 @@ VALID_TRANSITIONS = {
 
 
 def submit_application(student_id: int, drive_id: int, db: Session) -> Application:
-    """Executes the 5-stage Pre-Application Guard Chain before persisting an application:
-
-    1. Drive Existence & Status Guard
-    2. Deadline Guard
-    3. Profile Completeness Guard
-    4. Eligibility Guard
-    5. Duplicate Guard
-    """
-    # 1. Drive Existence & Status Guard
     drive = db.query(PlacementDrive).filter(PlacementDrive.id == drive_id).first()
     if not drive:
         raise HTTPException(
@@ -45,7 +36,6 @@ def submit_application(student_id: int, drive_id: int, db: Session) -> Applicati
             detail=f"Cannot apply to drive with status '{eval_status.value}'. Drive must be OPEN."
         )
 
-    # 2. Deadline Guard
     now_utc = datetime.now(timezone.utc)
     deadline = drive.application_deadline
     if deadline.tzinfo is None:
@@ -57,7 +47,6 @@ def submit_application(student_id: int, drive_id: int, db: Session) -> Applicati
             detail="Application period for this drive has closed."
         )
 
-    # Fetch Student Profile (auto-create blank if missing)
     student = db.query(Student).filter(Student.id == student_id).first()
     if not student:
         student = Student(id=student_id, student_code=f"STU{student_id:06d}")
@@ -65,7 +54,6 @@ def submit_application(student_id: int, drive_id: int, db: Session) -> Applicati
         db.commit()
         db.refresh(student)
 
-    # 3. Profile Completeness Guard
     _, is_complete, missing_fields = calculate_profile_completeness(student)
     if not is_complete:
         missing_str = ", ".join(missing_fields)
@@ -74,7 +62,6 @@ def submit_application(student_id: int, drive_id: int, db: Session) -> Applicati
             detail=f"Please complete your profile before applying. Missing fields: [{missing_str}]"
         )
 
-    # 4. Eligibility Guard
     is_eligible, reasons = evaluate_student_eligibility(student, drive)
     if not is_eligible:
         reasons_str = "; ".join(reasons)
@@ -83,7 +70,6 @@ def submit_application(student_id: int, drive_id: int, db: Session) -> Applicati
             detail=f"You are not eligible for this drive. Reasons: [{reasons_str}]"
         )
 
-    # 5. Duplicate Guard
     existing = db.query(Application).filter(
         Application.student_id == student_id,
         Application.drive_id == drive_id
@@ -112,7 +98,6 @@ def transition_application_status(
     current_user: User,
     db: Session
 ) -> Application:
-    """Enforces state machine transitions and recruiter company scoping."""
     app_record = db.query(Application).filter(Application.id == application_id).first()
     if not app_record:
         raise HTTPException(
@@ -120,7 +105,6 @@ def transition_application_status(
             detail=f"Application with ID {application_id} not found."
         )
 
-    # Recruiter Company Scoping Guard
     if current_user.role == UserRole.RECRUITER:
         recruiter = db.query(Recruiter).filter(Recruiter.id == current_user.id).first()
         if not recruiter or recruiter.company_id != app_record.drive.company_id:
@@ -130,20 +114,37 @@ def transition_application_status(
             )
 
     current_status = app_record.status
-
-    # Idempotent same-status check
     if current_status == target_status:
         return app_record
 
-    # State Machine Transition Validation
     allowed_next_states = VALID_TRANSITIONS.get(current_status, set())
     if target_status not in allowed_next_states:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid status transition from {current_status.value} to {target_status.value}. Candidates must follow proper workflow stages."
+            detail=f"Invalid status transition from {current_status.value} to {target_status.value}."
         )
 
     app_record.status = target_status
+
+    # Trigger In-App Notification Events
+    company_name = app_record.drive.company.name if (app_record.drive and app_record.drive.company) else "Company"
+    job_title = app_record.drive.job_title if app_record.drive else "Job Position"
+
+    if target_status == ApplicationStatus.SHORTLISTED:
+        create_notification(
+            db=db,
+            user_id=app_record.student_id,
+            title="Application Shortlisted",
+            message=f"Your application for {job_title} at {company_name} has been shortlisted!"
+        )
+    elif target_status == ApplicationStatus.REJECTED:
+        create_notification(
+            db=db,
+            user_id=app_record.student_id,
+            title="Application Status Update",
+            message=f"Your application status for {job_title} at {company_name} has been updated to Rejected."
+        )
+
     db.commit()
     db.refresh(app_record)
     return app_record
